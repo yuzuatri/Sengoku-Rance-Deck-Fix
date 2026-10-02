@@ -1,4 +1,4 @@
-# Sengoku Rance Proton Fix
+# Sengoku Rance Deck Fix
 
 A small fix for the **Steam Simplified Chinese version** when Steam says the game is running but no window opens.
 
