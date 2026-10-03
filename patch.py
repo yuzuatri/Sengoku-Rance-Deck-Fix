@@ -30,6 +30,7 @@ ORIGINAL_INSTRUCTION = bytes.fromhex("68 98 d6 00 00")
 PATCHED_INSTRUCTION = bytes.fromhex("68 a8 03 00 00")
 BACKUP_DIR = ".rance-proton-fix"
 BACKUP_NAME = "Rance7.original.exe"
+FONT_SOURCE = Path(__file__).resolve().with_name("simhei.ttf")
 
 
 class PatchError(Exception):
@@ -123,7 +124,7 @@ def read_vdf(path):
         return {}
 
 
-def discover_games(home=None, media_root=None):
+def steam_libraries(home=None, media_root=None):
     home = Path.home() if home is None else Path(home)
     media_root = Path("/run/media") if media_root is None else Path(media_root)
     roots = [home / ".local/share/Steam", home / ".steam/steam", home / ".steam/root",
@@ -141,8 +142,12 @@ def discover_games(home=None, media_root=None):
     # Support both current and older Steam Deck microSD mount layouts.
     for pattern in ("*/steamapps", "*/*/steamapps"):
         libraries.update(path.parent for path in media_root.glob(pattern))
+    return libraries
+
+
+def discover_games(home=None, media_root=None):
     found = set()
-    for library in libraries:
+    for library in steam_libraries(home, media_root):
         apps = library / "steamapps"
         manifest = read_vdf(apps / f"appmanifest_{APP_ID}.acf").get("AppState", {})
         name = GAME_NAME
@@ -154,6 +159,74 @@ def discover_games(home=None, media_root=None):
         if (game / EXE_NAME).is_file():
             found.add(game.resolve())
     return sorted(found)
+
+
+def font_directory(game, explicit=None):
+    """Find an existing game prefix; never create an uninitialized prefix."""
+    def windows_dir(prefix):
+        windows = prefix / "drive_c/windows"
+        return windows if windows.is_dir() else None
+
+    if explicit:
+        windows = windows_dir(Path(explicit).expanduser().resolve())
+        if windows is None:
+            raise PatchError("Invalid --proton-prefix: choose the pfx folder containing drive_c/windows.")
+    else:
+        relative = Path("compatdata") / APP_ID / "pfx"
+        windows = None
+        game = Path(game).resolve()
+        if game.parent.name == "common" and game.parent.parent.name == "steamapps":
+            windows = windows_dir(game.parent.parent / relative)
+        if windows is None:
+            candidates = {path.resolve() for library in steam_libraries()
+                          for path in [windows_dir(library / "steamapps" / relative)]
+                          if path is not None}
+            if not candidates:
+                raise PatchError("Proton folder not found. Launch the game once through Steam, close it, "
+                                 "then run apply again. For a custom prefix, use --proton-prefix /path/to/pfx.")
+            if len(candidates) != 1:
+                raise PatchError("Multiple Proton folders found. Choose one with --proton-prefix /path/to/pfx.")
+            windows = candidates.pop()
+    matches = [path for path in windows.iterdir() if path.name.casefold() == "fonts"]
+    if len(matches) > 1:
+        raise PatchError("Multiple Fonts folders found in the Proton prefix; no font was installed.")
+    return matches[0] if matches else windows / "Fonts"
+
+
+def install_font(game, proton_prefix=None):
+    """Install an optional user-provided font without replacing an existing one."""
+    if not FONT_SOURCE.exists() and not FONT_SOURCE.is_symlink():
+        return ""
+    try:
+        folder = font_directory(game, proton_prefix)
+        if folder.is_symlink():
+            raise PatchError("Fonts folder is a symbolic link; refusing to write through it.")
+        folder.mkdir(exist_ok=True)
+        for existing in folder.iterdir():
+            if existing.name.casefold() == "simhei.ttf":
+                return f"SimHei already present; existing file kept: {existing}"
+        with os.fdopen(os.open(FONT_SOURCE, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 12 <= info.st_size <= 64 * 1024 * 1024:
+                raise PatchError("simhei.ttf is not a supported font file.")
+            data = stream.read()
+        if data[:4] != b"\x00\x01\x00\x00":
+            raise PatchError("simhei.ttf does not have a TrueType font header.")
+        target = folder / "simhei.ttf"
+        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if target.read_bytes() != data:
+                raise PatchError("Font copy verification failed.")
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        return f"SimHei installed: {target}\nRestart the game to make the font available."
+    except (OSError, PatchError) as error:
+        raise PatchError(f"The startup fix is applied, but SimHei was not installed: {error}") from error
 
 
 def game_path(explicit=None):
@@ -243,7 +316,7 @@ def replace_executable(path, expected, replacement):
         temp_path.unlink(missing_ok=True)
 
 
-def operate(game, action):
+def operate(game, action, proton_prefix=None):
     game = Path(game)
     exe = game / EXE_NAME
     data = read_executable(exe)
@@ -262,8 +335,11 @@ def operate(game, action):
         if state == "unsupported":
             raise PatchError("Unsupported executable. This may be another language or an updated build.\n"
                              f"No executable or backup was changed. SHA-256: {digest(data)}")
-        if (action, state) in (("apply", "patched"), ("restore", "original")):
-            return "Already patched. No changes made." if action == "apply" else "Already original. No changes made."
+        if action == "apply" and state == "patched":
+            font_message = install_font(game, proton_prefix)
+            return "Startup fix already applied." + (f"\n{font_message}" if font_message else " No changes made.")
+        if action == "restore" and state == "original":
+            return "Already original. No changes made."
         backup = game / BACKUP_DIR / BACKUP_NAME
         if action == "apply":
             replacement = transform(data)
@@ -277,9 +353,12 @@ def operate(game, action):
         replace_executable(exe, data, replacement)
         if read_executable(exe) != replacement:
             raise PatchError("Final verification failed. Your original backup is still available.")
+        if action == "restore":
+            return "Original executable restored. Backup kept."
+        font_message = install_font(game, proton_prefix)
         return ("Startup fix applied. Launch from Steam as usual.\n"
                 "No special launch options are needed for this fix.\n"
-                f"Original backup: {backup}") if action == "apply" else "Original executable restored. Backup kept."
+                f"Original backup: {backup}" + (f"\n{font_message}" if font_message else ""))
 
 
 class Dialogs:
@@ -307,7 +386,7 @@ class Dialogs:
         return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def run_gui(explicit=None):
+def run_gui(explicit=None, proton_prefix=None):
     dialogs = Dialogs()
     try:
         games = [game_path(explicit)] if explicit else discover_games()
@@ -321,11 +400,18 @@ def run_gui(explicit=None):
         state = identify(read_executable(game / EXE_NAME))
         if state == "unsupported":
             raise PatchError(operate(game, "status"))
+        if state == "patched" and FONT_SOURCE.exists():
+            if dialogs.confirm(f"{game}\n\nThe startup fix is already applied. Install SimHei from simhei.ttf?\n"
+                               "Close the game first. Choose No to continue to the restore option."):
+                dialogs.message(operate(game, "apply", proton_prefix))
+                return 0
         action = "restore" if state == "patched" else "apply"
         question = ("The startup fix is already applied. Restore the original executable?" if state == "patched"
                     else "Apply the startup fix for the Simplified Chinese Steam build?\nAn original backup will be kept.")
+        if action == "apply" and FONT_SOURCE.exists():
+            question += "\nSimHei will also be copied into this game's Proton Fonts folder."
         if dialogs.confirm(f"{game}\n\n{question}\n\nClose the game first."):
-            dialogs.message(operate(game, action))
+            dialogs.message(operate(game, action, proton_prefix))
         return 0
     except (PatchError, OSError) as error:
         dialogs.message(str(error), error=True)
@@ -336,6 +422,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", nargs="?", choices=("status", "apply", "restore"), default="status")
     parser.add_argument("--game-dir", help="Folder containing Rance7.exe; auto-detected when omitted")
+    parser.add_argument("--proton-prefix", help="Optional pfx folder for SimHei installation; auto-detected when omitted")
     parser.add_argument("--gui", action="store_true", help="Use KDE or Zenity desktop dialogs")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
@@ -343,8 +430,8 @@ def main(argv=None):
         if args.gui:
             if args.action != "status":
                 parser.error("--gui chooses the action interactively; omit the action argument")
-            return run_gui(args.game_dir)
-        print(operate(game_path(args.game_dir), args.action))
+            return run_gui(args.game_dir, args.proton_prefix)
+        print(operate(game_path(args.game_dir), args.action, args.proton_prefix))
         return 0
     except (PatchError, OSError) as error:
         print(f"Error: {error}", file=sys.stderr)
